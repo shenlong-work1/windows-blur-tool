@@ -11,14 +11,125 @@ Usage:
     python blur_overlay.py
 """
 
+import os
+import shutil
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 import threading
 import time
 import ctypes
 import ctypes.wintypes
-from PIL import Image, ImageFilter, ImageTk
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
 import mss
+
+try:
+    import pytesseract
+
+    HAS_PYTESSERACT = True
+except ImportError:
+    pytesseract = None  # type: ignore
+    HAS_PYTESSERACT = False
+
+try:
+    _LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    _LANCZOS = Image.LANCZOS
+
+_TESSERACT_RUNTIME_OK: bool | None = None
+
+
+def tesseract_runtime_available() -> bool:
+    """
+    True if pytesseract is installed and the Tesseract OCR engine is callable.
+    Caches the result after first successful check.
+    """
+    global _TESSERACT_RUNTIME_OK
+    if _TESSERACT_RUNTIME_OK is not None:
+        return _TESSERACT_RUNTIME_OK
+    if not HAS_PYTESSERACT or pytesseract is None:
+        _TESSERACT_RUNTIME_OK = False
+        return False
+    if shutil.which("tesseract"):
+        try:
+            pytesseract.get_tesseract_version()
+            _TESSERACT_RUNTIME_OK = True
+            return True
+        except Exception:
+            pass
+    for base in (
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    ):
+        exe = os.path.join(base, "Tesseract-OCR", "tesseract.exe")
+        if os.path.isfile(exe):
+            pytesseract.pytesseract.tesseract_cmd = exe
+            try:
+                pytesseract.get_tesseract_version()
+                _TESSERACT_RUNTIME_OK = True
+                return True
+            except Exception:
+                break
+    _TESSERACT_RUNTIME_OK = False
+    return False
+
+
+def ocr_word_boxes(img: Image.Image, max_width: int = 960) -> list[tuple[int, int, int, int]]:
+    """
+    Return bounding boxes (left, top, width, height) in *img* pixel coordinates
+    for detected text. Uses a downscaled copy for speed, then scales boxes back.
+    """
+    if not HAS_PYTESSERACT or pytesseract is None:
+        return []
+    ow, oh = img.size
+    if ow <= 0 or oh <= 0:
+        return []
+    small = img.convert("RGB")
+    if ow > max_width:
+        ratio = max_width / ow
+        nh = max(1, int(oh * ratio))
+        small = small.resize((max_width, nh), _LANCZOS)
+    sx = ow / small.width
+    sy = oh / small.height
+
+    data = pytesseract.image_to_data(small, output_type=pytesseract.Output.DICT)
+    n = len(data.get("text", []))
+    out: list[tuple[int, int, int, int]] = []
+    for i in range(n):
+        t = (data["text"][i] or "").strip()
+        if not t:
+            continue
+        conf = data["conf"][i]
+        try:
+            c = float(conf)
+        except (TypeError, ValueError):
+            continue
+        if c < 0 or c < 30:
+            continue
+        left = int(data["left"][i] * sx)
+        top = int(data["top"][i] * sy)
+        w = max(1, int(data["width"][i] * sx))
+        h = max(1, int(data["height"][i] * sy))
+        out.append((left, top, w, h))
+    return out
+
+
+def build_text_keep_mask(
+    size: tuple[int, int],
+    boxes: list[tuple[int, int, int, int]],
+    pad: int = 6,
+) -> Image.Image:
+    """Grayscale mask: 255 = keep sharp (text), 0 = blur."""
+    w, h = size
+    mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask)
+    for bx, by, bw, bh in boxes:
+        x1 = max(0, bx - pad)
+        y1 = max(0, by - pad)
+        x2 = min(w - 1, bx + bw + pad)
+        y2 = min(h - 1, by + bh + pad)
+        if x2 > x1 and y2 > y1:
+            draw.rectangle([x1, y1, x2, y2], fill=255)
+    return mask
 
 
 # ─── Windows API helpers ───────────────────────────────────────────────────────
@@ -105,14 +216,29 @@ class BlurWindow:
 
     BORDER       = 6    # px — resize-handle thickness
     MIN_SIZE     = 80   # minimum width/height in px
+    MAX_FPS      = 144  # UI slider cap; capture loop has no 50 FPS floor anymore
 
-    def __init__(self, parent, x, y, w, h, blur_radius_var, fps_var, on_close):
+    def __init__(
+        self,
+        parent,
+        x,
+        y,
+        w,
+        h,
+        blur_radius_var,
+        fps_var,
+        preserve_text_var,
+        on_close,
+    ):
         self.parent         = parent
         self.blur_radius_var = blur_radius_var
         self.fps_var        = fps_var
+        self.preserve_text_var = preserve_text_var
         self.on_close       = on_close
         self.running        = False
         self._photo         = None          # keep ImageTk reference alive
+        self._ocr_boxes_lock = threading.Lock()
+        self._ocr_boxes: list[tuple[int, int, int, int]] = []
 
         # ── build the toplevel window ──────────────────────────────────────
         self.win = tk.Toplevel(parent)
@@ -172,6 +298,8 @@ class BlurWindow:
         self.running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
+        self._ocr_thread = threading.Thread(target=self._ocr_refresh_loop, daemon=True)
+        self._ocr_thread.start()
 
     def set_click_through(self, enabled: bool):
         self._click_through = enabled
@@ -257,11 +385,38 @@ class BlurWindow:
 
     # ── capture / blur loop ───────────────────────────────────────────────────
 
+    def _ocr_refresh_loop(self):
+        """Updates text bounding boxes a few times per second when preserve-text is on."""
+        while self.running:
+            try:
+                if not self.preserve_text_var.get() or not tesseract_runtime_available():
+                    time.sleep(0.35)
+                    continue
+                x = self.win.winfo_x()
+                y = self.win.winfo_y()
+                w = self.win.winfo_width()
+                h = self.win.winfo_height()
+                if w < 8 or h < 8:
+                    time.sleep(0.2)
+                    continue
+                region = {"top": y, "left": x, "width": w, "height": h}
+                with mss.mss() as sct:
+                    shot = sct.grab(region)
+                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                boxes = ocr_word_boxes(img)
+                with self._ocr_boxes_lock:
+                    self._ocr_boxes = boxes
+            except Exception:
+                pass
+            time.sleep(0.35)
+
     def _capture_loop(self):
         with mss.mss() as sct:
             while self.running:
                 try:
-                    delay = max(0.02, 1.0 / max(1, self.fps_var.get()))
+                    fps = max(1, self.fps_var.get())
+                    # No 20ms floor here — that capped effective FPS at ~50 regardless of slider.
+                    delay = max(1.0 / 1000.0, 1.0 / fps)
                     x = self.win.winfo_x()
                     y = self.win.winfo_y()
                     w = self.win.winfo_width()
@@ -274,7 +429,19 @@ class BlurWindow:
                     radius  = self.blur_radius_var.get()
                     blurred = img.filter(ImageFilter.GaussianBlur(radius=radius))
 
-                    photo = ImageTk.PhotoImage(blurred)
+                    out = blurred
+                    if (
+                        self.preserve_text_var.get()
+                        and tesseract_runtime_available()
+                        and img.size == blurred.size
+                    ):
+                        with self._ocr_boxes_lock:
+                            boxes = list(self._ocr_boxes)
+                        if boxes:
+                            mask = build_text_keep_mask(img.size, boxes)
+                            out = Image.composite(img, blurred, mask)
+
+                    photo = ImageTk.PhotoImage(out)
                     self.canvas.after(0, self._draw, photo)
                     time.sleep(delay)
                 except Exception:
@@ -318,13 +485,14 @@ class ControlPanel:
 
         # ── shared vars ────────────────────────────────────────────────────
         self.blur_radius_var = tk.IntVar(value=18)
-        self.fps_var         = tk.IntVar(value=20)
+        self.fps_var         = tk.IntVar(value=60)
         self.overlay_x_var   = tk.IntVar(value=300)
         self.overlay_y_var   = tk.IntVar(value=200)
         self.overlay_w_var   = tk.IntVar(value=420)
         self.overlay_h_var   = tk.IntVar(value=600)
         self.always_on_top_var = tk.BooleanVar(value=True)
         self.click_through_var = tk.BooleanVar(value=False)
+        self.preserve_text_var = tk.BooleanVar(value=False)
 
         self._blur_win: BlurWindow | None = None
         self._selector_win: tk.Toplevel | None = None
@@ -379,7 +547,7 @@ class ControlPanel:
         self._fps_label.pack(side="right")
         tk.Scale(
             row2, variable=self.fps_var,
-            from_=1, to=30, orient="horizontal",
+            from_=1, to=BlurWindow.MAX_FPS, orient="horizontal",
             bg=self.CARD, fg=self.FG, troughcolor="#414162",
             highlightthickness=0, bd=0, showvalue=False,
             command=lambda v: self._fps_label.config(text=v),
@@ -471,6 +639,22 @@ class ControlPanel:
         )
         self.click_btn.pack(fill="x")
 
+        preserve_row = tk.Frame(self.root, bg=self.BG)
+        preserve_row.pack(pady=(0, 10), padx=16, fill="x")
+        self.preserve_btn = tk.Button(
+            preserve_row,
+            text="📝 Keep text sharp (blur images/video): OFF",
+            command=self._toggle_preserve_text,
+            bg="#cba6f7",
+            fg="#1e1e2e",
+            font=("Segoe UI", 9, "bold"),
+            relief="flat",
+            cursor="hand2",
+            padx=10,
+            pady=5,
+        )
+        self.preserve_btn.pack(fill="x")
+
         # ── status bar ────────────────────────────────────────────────────
         self.status_var = tk.StringVar(value="Ready — click Start blur to begin")
         tk.Label(self.root, textvariable=self.status_var,
@@ -478,8 +662,8 @@ class ControlPanel:
                  anchor="w").pack(fill="x", padx=16, pady=(0, 10))
 
         # ── tip ───────────────────────────────────────────────────────────
-        tip = ("Tip: click 'Select area with mouse' to draw blur region quickly.\n"
-               "You can still drag/resize the blur window afterward.")
+        tip = ("Tip: 'Keep text sharp' uses OCR (pytesseract + Tesseract) to leave text readable\n"
+               "while blurring photos/video in the same region. See README for install.")
         tk.Label(self.root, text=tip, font=("Segoe UI", 8), fg="#585b70",
                  bg=self.BG, justify="left", anchor="w").pack(fill="x", padx=16, pady=(0, 12))
 
@@ -506,6 +690,7 @@ class ControlPanel:
             h               = self.overlay_h_var.get(),
             blur_radius_var = self.blur_radius_var,
             fps_var         = self.fps_var,
+            preserve_text_var = self.preserve_text_var,
             on_close        = self._on_overlay_closed,
         )
         self.start_btn.config(state="disabled")
@@ -513,7 +698,12 @@ class ControlPanel:
         self.stop_btn.config(state="normal")
         self._apply_always_on_top()
         self._apply_click_through()
-        self.status_var.set("✔ Blur overlay is active — drag it over LDPlayer")
+        if self.preserve_text_var.get() and tesseract_runtime_available():
+            self.status_var.set(
+                "Blur active — keep-text ON: OCR updates ~3×/s; text stays sharp where detected"
+            )
+        else:
+            self.status_var.set("✔ Blur overlay is active — drag it over LDPlayer")
 
     def _select_area(self):
         if self._blur_win:
@@ -652,6 +842,50 @@ class ControlPanel:
     def _toggle_click_through(self):
         self.click_through_var.set(not self.click_through_var.get())
         self._apply_click_through()
+
+    def _toggle_preserve_text(self):
+        new_val = not self.preserve_text_var.get()
+        if new_val:
+            global _TESSERACT_RUNTIME_OK
+            _TESSERACT_RUNTIME_OK = None
+            if not HAS_PYTESSERACT:
+                messagebox.showwarning(
+                    "Text-preservation unavailable",
+                    "Install the Python package:\n"
+                    "  pip install pytesseract\n\n"
+                    "Then install the Tesseract OCR engine for Windows:\n"
+                    "https://github.com/UB-Mannheim/tesseract/wiki",
+                )
+                return
+            if not tesseract_runtime_available():
+                messagebox.showwarning(
+                    "Tesseract OCR not found",
+                    "Install Tesseract OCR (includes tesseract.exe).\n"
+                    "Typical path: C:\\Program Files\\Tesseract-OCR\\\n"
+                    "Or add the folder that contains tesseract.exe to PATH.",
+                )
+                return
+        self.preserve_text_var.set(new_val)
+        self._sync_preserve_text_btn()
+        if self._blur_win:
+            if new_val:
+                self.status_var.set(
+                    "Keep-text ON — text stays sharp; photos/video blurred (OCR ~3×/s)"
+                )
+            else:
+                self.status_var.set("Keep-text OFF — entire blur area is blurred")
+
+    def _sync_preserve_text_btn(self):
+        if self.preserve_text_var.get():
+            self.preserve_btn.config(
+                text="📝 Keep text sharp (blur images/video): ON",
+                bg="#a6e3a1",
+            )
+        else:
+            self.preserve_btn.config(
+                text="📝 Keep text sharp (blur images/video): OFF",
+                bg="#cba6f7",
+            )
 
     def _apply_click_through(self):
         enabled = self.click_through_var.get()

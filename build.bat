@@ -9,16 +9,16 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] Installing build dependencies...
+echo [2/3] Installing build and runtime dependencies...
 python -m pip install --upgrade pip
-python -m pip install pyinstaller pillow mss
+python -m pip install pyinstaller pillow mss pytesseract
 if errorlevel 1 (
     echo Failed to install dependencies.
     exit /b 1
 )
 
 echo [3/3] Building EXE...
-python -m PyInstaller --onefile --windowed --name ScreenBlurOverlay app.py
+python -m PyInstaller --onefile --windowed --name ScreenBlurOverlay --hidden-import=pytesseract app.py
 if errorlevel 1 (
     echo Build failed.
     exit /b 1
@@ -26,4 +26,6 @@ if errorlevel 1 (
 
 echo.
 echo Build complete: dist\ScreenBlurOverlay.exe
+echo.
+echo Note: Keep-text mode needs Tesseract OCR on the machine ^(see README.md^).
 pause

@@ -9,6 +9,7 @@ Real-time screen blur overlay for Windows. Draw a region on your screen and keep
 - **OS:** Windows (uses Win32 APIs for topmost z-order, click-through, and capture exclusion)
 - **Python:** 3.10 or newer
 - **Dependencies:** `pillow`, `mss`, `tkinter` (usually bundled with Python on Windows)
+- **Optional (keep-text mode):** `pytesseract` plus the [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) engine (Windows installer: [UB Mannheim builds](https://github.com/UB-Mannheim/tesseract/wiki))
 
 ## Quick start
 
@@ -17,6 +18,8 @@ cd path\to\windows-blur-tool
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install pillow mss
+# Optional — blur photos/video but keep text readable (see below)
+python -m pip install pytesseract
 python app.py
 ```
 
@@ -27,8 +30,19 @@ python app.py
 - **Manual position/size** — Optional numeric fields for exact placement
 - **Always on top** — Keeps the control panel and overlay above other windows (Tk + Win32 `SetWindowPos`)
 - **Click-through** — Lets mouse events pass through the blur window to apps underneath while the blur stays visible (requires always-on-top behavior)
-- **Adjustable blur strength and FPS** — Sliders in the control panel
+- **Adjustable blur strength and FPS** — Sliders (FPS up to 144; real speed depends on CPU and region size)
 - **Movable overlay** — Drag and resize the blur window after it starts
+- **Keep text sharp** — Optional: blur non-text areas while leaving detected text readable (OCR-based; not perfect for all UIs)
+
+### Keep text sharp (optional)
+
+This mode uses **Tesseract** to find text in the blurred region and paste the **sharp** original back over those boxes, so **photos and video stay blurred** but **text stays readable** where OCR detects it.
+
+1. `pip install pytesseract`
+2. Install Tesseract OCR for Windows (e.g. `C:\Program Files\Tesseract-OCR\tesseract.exe` or add it to `PATH`).
+3. Turn on **“Keep text sharp (blur images/video)”** in the control panel.
+
+OCR runs about **three times per second** (to keep CPU use reasonable), so boxes can lag slightly if content scrolls quickly. Decorative text in images may still be blurred if OCR does not treat it as text.
 
 ## Build a standalone EXE
 
@@ -41,6 +55,8 @@ From the project folder:
 Output: `dist\ScreenBlurOverlay.exe`
 
 The script installs PyInstaller plus runtime deps and runs PyInstaller. You can also use `ScreenBlurOverlay.spec` if you customize the build.
+
+If you use keep-text mode in a packaged EXE, users still need the **Tesseract engine** installed (or you must bundle `tesseract.exe` and point `pytesseract` to it); the Python wheel alone is not enough.
 
 ## Contributing / cloning
 
