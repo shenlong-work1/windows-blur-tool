@@ -1,7 +1,19 @@
 @echo off
 setlocal
 
-echo [1/3] Checking Python...
+set "VENV_ACTIVATE=.venv\Scripts\activate.bat"
+if exist "%VENV_ACTIVATE%" (
+    echo [1/4] Activating virtual environment...
+    call "%VENV_ACTIVATE%"
+    if errorlevel 1 (
+        echo Failed to activate virtual environment: %VENV_ACTIVATE%
+        exit /b 1
+    )
+) else (
+    echo [1/4] No .venv found, using system Python...
+)
+
+echo [2/4] Checking Python...
 python --version >nul 2>&1
 if errorlevel 1 (
     echo Python is not installed or not in PATH.
@@ -9,7 +21,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] Installing build and runtime dependencies...
+echo [3/4] Installing build and runtime dependencies...
 python -m pip install --upgrade pip
 python -m pip install pyinstaller pillow mss pytesseract
 if errorlevel 1 (
@@ -17,7 +29,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [3/3] Building EXE...
+echo [4/4] Building EXE...
 python -m PyInstaller --onefile --windowed --name ScreenBlurOverlay --hidden-import=pytesseract app.py
 if errorlevel 1 (
     echo Build failed.

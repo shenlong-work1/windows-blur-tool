@@ -38,6 +38,109 @@ except AttributeError:
 _TESSERACT_RUNTIME_OK: bool | None = None
 
 
+def enable_dpi_awareness():
+    """
+    Make process DPI-aware so Tk/window coordinates match captured pixels.
+    Safe no-op on unsupported Windows versions.
+    """
+    try:
+        # Windows 10+ per-monitor v2 DPI awareness.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        # Windows 8.1 fallback.
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        # Older fallback.
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def get_virtual_screen_rect() -> tuple[int, int, int, int]:
+    """
+    Return (left, top, width, height) for the full virtual desktop.
+    Handles multi-monitor layouts, including negative coordinates.
+    """
+    try:
+        SM_XVIRTUALSCREEN = 76
+        SM_YVIRTUALSCREEN = 77
+        SM_CXVIRTUALSCREEN = 78
+        SM_CYVIRTUALSCREEN = 79
+        user32 = ctypes.windll.user32
+        left = int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+        top = int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+        width = int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+        height = int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+        if width > 0 and height > 0:
+            return left, top, width, height
+    except Exception:
+        pass
+    return 0, 0, 1920, 1080
+
+
+def normalize_overlay_rect(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
+    """
+    Clamp overlay rect to current virtual desktop and minimum size.
+    """
+    left, top, v_w, v_h = get_virtual_screen_rect()
+    right = left + v_w
+    bottom = top + v_h
+    w = max(BlurWindow.MIN_SIZE, min(int(w), max(BlurWindow.MIN_SIZE, v_w)))
+    h = max(BlurWindow.MIN_SIZE, min(int(h), max(BlurWindow.MIN_SIZE, v_h)))
+    x = int(max(left, min(int(x), right - w)))
+    y = int(max(top, min(int(y), bottom - h)))
+    return x, y, w, h
+
+
+def _safe_int(value, fallback: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return fallback
+
+
+def get_tk_virtual_rect(widget: tk.Misc) -> tuple[int, int, int, int]:
+    """
+    Return (left, top, width, height) in Tk coordinate space.
+    Falls back to Win32 virtual-screen metrics if Tk values are unavailable.
+    """
+    try:
+        left = _safe_int(widget.winfo_vrootx(), 0)
+        top = _safe_int(widget.winfo_vrooty(), 0)
+        width = _safe_int(widget.winfo_vrootwidth(), 0)
+        height = _safe_int(widget.winfo_vrootheight(), 0)
+        if width > 0 and height > 0:
+            return left, top, width, height
+    except Exception:
+        pass
+    return get_virtual_screen_rect()
+
+
+def get_tk_to_screen_scale(widget: tk.Misc) -> tuple[float, float]:
+    """
+    Return scale factors from Tk coords -> physical screen pixels.
+    On DPI-aware setups these are typically (1.0, 1.0).
+    """
+    try:
+        _left, _top, phys_w, phys_h = get_virtual_screen_rect()
+        _tleft, _ttop, tk_w, tk_h = get_tk_virtual_rect(widget)
+        if phys_w > 0 and phys_h > 0 and tk_w > 0 and tk_h > 0:
+            sx = phys_w / float(tk_w)
+            sy = phys_h / float(tk_h)
+            # Guard against pathological values.
+            if 0.1 <= sx <= 10.0 and 0.1 <= sy <= 10.0:
+                return sx, sy
+    except Exception:
+        pass
+    return 1.0, 1.0
+
+
 def tesseract_runtime_available() -> bool:
     """
     True if pytesseract is installed and the Tesseract OCR engine is callable.
@@ -217,6 +320,7 @@ class BlurWindow:
     BORDER       = 6    # px — resize-handle thickness
     MIN_SIZE     = 80   # minimum width/height in px
     MAX_FPS      = 144  # UI slider cap; capture loop has no 50 FPS floor anymore
+    TARGET_PIXELS_PER_SEC = 45_000_000  # adaptive cap for CPU control on large regions
 
     def __init__(
         self,
@@ -237,8 +341,10 @@ class BlurWindow:
         self.on_close       = on_close
         self.running        = False
         self._photo         = None          # keep ImageTk reference alive
+        self._image_item    = None
         self._ocr_boxes_lock = threading.Lock()
         self._ocr_boxes: list[tuple[int, int, int, int]] = []
+        self._screen_scale_x, self._screen_scale_y = get_tk_to_screen_scale(parent)
 
         # ── build the toplevel window ──────────────────────────────────────
         self.win = tk.Toplevel(parent)
@@ -399,7 +505,12 @@ class BlurWindow:
                 if w < 8 or h < 8:
                     time.sleep(0.2)
                     continue
-                region = {"top": y, "left": x, "width": w, "height": h}
+                region = {
+                    "top": int(round(y * self._screen_scale_y)),
+                    "left": int(round(x * self._screen_scale_x)),
+                    "width": max(1, int(round(w * self._screen_scale_x))),
+                    "height": max(1, int(round(h * self._screen_scale_y))),
+                }
                 with mss.mss() as sct:
                     shot = sct.grab(region)
                 img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
@@ -414,20 +525,24 @@ class BlurWindow:
         with mss.mss() as sct:
             while self.running:
                 try:
-                    fps = max(1, self.fps_var.get())
-                    # No 20ms floor here — that capped effective FPS at ~50 regardless of slider.
-                    delay = max(1.0 / 1000.0, 1.0 / fps)
                     x = self.win.winfo_x()
                     y = self.win.winfo_y()
                     w = self.win.winfo_width()
                     h = self.win.winfo_height()
+                    fps = self._effective_fps(w, h)
+                    delay = max(1.0 / 1000.0, 1.0 / fps)
 
-                    region = {"top": y, "left": x, "width": w, "height": h}
+                    region = {
+                        "top": int(round(y * self._screen_scale_y)),
+                        "left": int(round(x * self._screen_scale_x)),
+                        "width": max(1, int(round(w * self._screen_scale_x))),
+                        "height": max(1, int(round(h * self._screen_scale_y))),
+                    }
                     shot   = sct.grab(region)
                     img    = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
                     radius  = self.blur_radius_var.get()
-                    blurred = img.filter(ImageFilter.GaussianBlur(radius=radius))
+                    blurred = self._blur_optimized(img, radius)
 
                     out = blurred
                     if (
@@ -450,10 +565,45 @@ class BlurWindow:
     def _draw(self, photo):
         if not self.running:
             return
-        self.canvas.delete("blur_img")
-        self.canvas.create_image(0, 0, anchor="nw", image=photo, tags="blur_img")
-        self.canvas.tag_lower("blur_img")        # keep close btn on top
+        if self._image_item is None:
+            self._image_item = self.canvas.create_image(
+                0, 0, anchor="nw", image=photo, tags="blur_img"
+            )
+            self.canvas.tag_lower("blur_img")    # keep close btn on top
+        else:
+            self.canvas.itemconfig(self._image_item, image=photo)
         self._photo = photo                      # prevent GC
+
+    def _effective_fps(self, width: int, height: int) -> int:
+        requested = max(1, int(self.fps_var.get()))
+        pixels = max(1, int(width) * int(height))
+        adaptive_cap = max(8, int(self.TARGET_PIXELS_PER_SEC / pixels))
+        return min(requested, adaptive_cap)
+
+    def _blur_optimized(self, img: Image.Image, radius: int) -> Image.Image:
+        if radius <= 0:
+            return img
+        w, h = img.size
+        pixels = w * h
+
+        # Downsample large or heavily blurred regions before applying blur.
+        # This significantly lowers CPU use while preserving visual quality.
+        scale = 1
+        if radius >= 18 or pixels >= 1_200_000:
+            scale = 3
+        elif radius >= 10 or pixels >= 600_000:
+            scale = 2
+
+        if scale == 1 or w < scale * 2 or h < scale * 2:
+            return img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+        small_w = max(1, w // scale)
+        small_h = max(1, h // scale)
+        small = img.resize((small_w, small_h), _LANCZOS)
+        small_blurred = small.filter(
+            ImageFilter.GaussianBlur(radius=max(1.0, float(radius) / scale))
+        )
+        return small_blurred.resize((w, h), _LANCZOS)
 
     # ── teardown ──────────────────────────────────────────────────────────────
 
@@ -485,7 +635,7 @@ class ControlPanel:
 
         # ── shared vars ────────────────────────────────────────────────────
         self.blur_radius_var = tk.IntVar(value=18)
-        self.fps_var         = tk.IntVar(value=60)
+        self.fps_var         = tk.IntVar(value=30)
         self.overlay_x_var   = tk.IntVar(value=300)
         self.overlay_y_var   = tk.IntVar(value=200)
         self.overlay_w_var   = tk.IntVar(value=420)
@@ -682,12 +832,27 @@ class ControlPanel:
     def _start(self):
         if self._blur_win:
             self._stop()
+        x = int(self.overlay_x_var.get())
+        y = int(self.overlay_y_var.get())
+        w = max(BlurWindow.MIN_SIZE, int(self.overlay_w_var.get()))
+        h = max(BlurWindow.MIN_SIZE, int(self.overlay_h_var.get()))
+        left, top, v_w, v_h = get_tk_virtual_rect(self.root)
+        right = left + v_w
+        bottom = top + v_h
+        w = min(w, max(BlurWindow.MIN_SIZE, v_w))
+        h = min(h, max(BlurWindow.MIN_SIZE, v_h))
+        x = max(left, min(x, right - w))
+        y = max(top, min(y, bottom - h))
+        self.overlay_x_var.set(x)
+        self.overlay_y_var.set(y)
+        self.overlay_w_var.set(w)
+        self.overlay_h_var.set(h)
         self._blur_win = BlurWindow(
             parent          = self.root,
-            x               = self.overlay_x_var.get(),
-            y               = self.overlay_y_var.get(),
-            w               = self.overlay_w_var.get(),
-            h               = self.overlay_h_var.get(),
+            x               = x,
+            y               = y,
+            w               = w,
+            h               = h,
             blur_radius_var = self.blur_radius_var,
             fps_var         = self.fps_var,
             preserve_text_var = self.preserve_text_var,
@@ -718,9 +883,8 @@ class ControlPanel:
         win.attributes("-alpha", 0.25)
         win.configure(bg="black")
 
-        screen_w = win.winfo_screenwidth()
-        screen_h = win.winfo_screenheight()
-        win.geometry(f"{screen_w}x{screen_h}+0+0")
+        left, top, screen_w, screen_h = get_tk_virtual_rect(self.root)
+        win.geometry(f"{screen_w}x{screen_h}+{left}+{top}")
 
         canvas = tk.Canvas(win, bg="black", highlightthickness=0, cursor="crosshair")
         canvas.pack(fill="both", expand=True)
@@ -920,5 +1084,6 @@ class ControlPanel:
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    enable_dpi_awareness()
     app = ControlPanel()
     app.run()
